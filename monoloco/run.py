@@ -44,6 +44,7 @@ def cli():
                                 help='use more exact image rescaling (requires scipy)')
     predict_parser.add_argument('--decoder-workers', default=None, type=int,
                                 help='number of workers for pose decoding, 0 for windows')
+    predict_parser.add_argument('--predict_loki', action='store_true')
 
     decoder.cli(parser)
     logger.cli(parser)
@@ -143,8 +144,12 @@ def main():
             from .visuals.webcam import webcam
             webcam(args)
         else:
-            from .predict import predict
-            predict(args)
+            if args.predict_loki:
+                from .predict import predict_loki
+                predict_loki(args)
+            else:
+                from .predict import predict
+                predict(args)
 
     elif args.command == 'prep':
         if 'nuscenes' in args.dataset:

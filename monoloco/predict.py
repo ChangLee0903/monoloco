@@ -120,7 +120,6 @@ def factory_from_args(args):
         args.device = torch.device('cuda')
         args.pin_memory = True
     LOG.debug('neural network device: %s', args.device)
-
     # Add visualization defaults
     if not args.output_types and args.mode != 'keypoints':
         args.output_types = ['multi']
@@ -258,6 +257,135 @@ def predict(args):
     std_time = int(np.std(timing))
     print(f'Processed {idx * args.batch_size} images with an average time of {avg_time} ms and a std of {std_time} ms')
 
+
+def factory_outputs(args, pifpaf_outs, dic_out, output_path, kk=None):
+    """
+    Output json files or images according to the choice
+    """
+    if 'json' in args.output_types:
+        with open(os.path.join(output_path + '.monoloco.json'), 'w') as ff:
+            json.dump(dic_out, ff)
+        if len(args.output_types) == 1:
+            return
+
+    with open(pifpaf_outs['file_name'], 'rb') as f:
+        cpu_image = PIL.Image.open(f).convert('RGB')
+    if args.mode == 'keypoints':
+        annotation_painter = openpifpaf.show.AnnotationPainter()
+        with openpifpaf.show.image_canvas(cpu_image, output_path) as ax:
+            annotation_painter.annotations(ax, pifpaf_outs['pred'])
+        return
+
+    if any((xx in args.output_types for xx in ['front', 'bird', 'multi'])):
+        LOG.info(output_path)
+        if args.activities:
+            show_activities(
+                args, cpu_image, output_path, pifpaf_outs['left'], dic_out)
+        else:
+            printer = Printer(cpu_image, output_path, kk, args)
+            figures, axes = printer.factory_axes(dic_out)
+            printer.draw(figures, axes, cpu_image, dic_out)
+
+
+def predict_loki(args):
+
+    cnt = 0
+    assert args.mode in ('keypoints', 'mono', 'stereo')
+    args, dic_models = factory_from_args(args)
+    # Load Models
+    if args.mode in ('mono', 'stereo'):
+        net = Loco(
+            model=dic_models[args.mode],
+            mode=args.mode,
+            device=args.device,
+            n_dropout=args.n_dropout,
+            p_dropout=args.dropout)
+
+    # for openpifpaf predictions
+    predictor = Predictor(checkpoint=args.checkpoint)
+    
+    pifpaf_outs = {}
+    start = time.time()
+    timing = []
+    file_lst = glob.glob(f'{args.images[0]}/*/*.png', recursive=True)
+    results = {}
+    for p in file_lst:
+        scene, step = p.split('/')[-2:]
+        if not scene in results:
+            results[scene] = {}
+        results[scene][step] = {}
+    from tqdm import tqdm
+    for img in tqdm(file_lst):
+        for idx, (pred, _, meta) in enumerate(predictor.images([img], batch_size=args.batch_size)):
+
+            if idx % args.batch_size != 0:  # Only for MonStereo
+                pifpaf_outs['right'] = [ann.json_data() for ann in pred]
+            else:
+                if args.json_output is not None:
+                    json_out_name = out_name(args.json_output, meta['file_name'], '.predictions.json')
+                    LOG.debug('json output = %s', json_out_name)
+                    with open(json_out_name, 'w') as f:
+                        json.dump([ann.json_data() for ann in pred], f)
+
+                pifpaf_outs['pred'] = pred
+                pifpaf_outs['left'] = [ann.json_data() for ann in pred]
+                pifpaf_outs['file_name'] = meta['file_name']
+                pifpaf_outs['width_height'] = meta['width_height']
+
+                # Set output image name
+                if args.output_directory is None:
+                    splits = os.path.split(meta['file_name'])
+                    output_path = os.path.join(splits[0], 'out_' + splits[1])
+                else:
+                    file_name = os.path.basename(meta['file_name'])
+                    output_path = os.path.join(
+                        args.output_directory, 'out_' + file_name)
+
+                im_name = os.path.basename(meta['file_name'])
+                print(f'{idx} image {im_name} saved as {output_path}')
+
+            if (args.mode == 'mono') or (args.mode == 'stereo' and idx % args.batch_size != 0):
+                # 3D Predictions
+                if args.mode == 'keypoints':
+                    dic_out = defaultdict(list)
+                    kk = None
+                else:
+                    im_size = (float(pifpaf_outs['width_height'][0]), float(pifpaf_outs['width_height'][1]))
+
+                    if args.path_gt is not None:
+                        dic_gt, kk = factory_for_gt(args.path_gt, im_name)
+                    else:
+                        kk = load_calibration(args.calibration, im_size, focal_length=args.focal_length)
+                        dic_gt = None
+                    # Preprocess pifpaf outputs and run monoloco
+                    boxes, keypoints = preprocess_pifpaf(
+                        pifpaf_outs['left'], im_size, enlarge_boxes=False)
+
+                    if args.mode == 'mono':
+                        LOG.info("Prediction with MonoLoco++")
+                        dic_out = net.forward(keypoints, kk)
+                        fwd_time = (time.time()-start)*1000
+                        timing.append(fwd_time)  # Skip Reordering and saving images
+                        print(f"Forward time: {fwd_time:.0f} ms")
+                        dic_out = net.post_process(
+                            dic_out, boxes, keypoints, kk, dic_gt)
+                        if 'social_distance' in args.activities:
+                            dic_out = net.social_distance(dic_out, args)
+                        if 'raise_hand' in args.activities:
+                            dic_out = net.raising_hand(dic_out, keypoints)
+
+                    else:
+                        LOG.info("Prediction with MonStereo")
+                        _, keypoints_r = preprocess_pifpaf(pifpaf_outs['right'], im_size)
+                        dic_out = net.forward(keypoints, kk, keypoints_r=keypoints_r)
+                        fwd_time = (time.time()-start)*1000
+                        timing.append(fwd_time)
+                        dic_out = net.post_process(
+                            dic_out, boxes, keypoints, kk, dic_gt)
+                    scene, step = img.split('/')[-2:]
+                    xyz_pos = dic_out['xyz_pred']
+                    results[scene][step] = xyz_pos
+    torch.save(results, 'results.pth')
 
 def factory_outputs(args, pifpaf_outs, dic_out, output_path, kk=None):
     """
